@@ -21,10 +21,19 @@ import signal
 import sys
 from typing import AsyncIterator, Tuple
 
+import json
+
 import torch
 import uvloop
-from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeAudioEncoder,
+    _get_feat_extract_output_lengths,
+)
+from vllm.transformers_utils.configs.qwen3_asr import Qwen3ASRConfig
+from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import dynamo.nixl_connect as connect
@@ -55,7 +64,14 @@ except ImportError as e:
 CACHE_SIZE_MAXIMUM = 8
 
 
-class VllmEncodeWorker:
+class AsrEncodeWorker:
+    """
+    Encode worker for Qwen3-ASR models.
+
+    Extracts audio encoder + projector embeddings from Qwen3-ASR and transfers
+    them via NIXL RDMA to a downstream PD worker running the Qwen3 LLM decoder.
+    """
+
     def __init__(
         self,
         args: argparse.Namespace,
@@ -67,69 +83,82 @@ class VllmEncodeWorker:
         self.model = self.engine_args.model
 
         self.audio_loader = AudioLoader(cache_size=CACHE_SIZE_MAXIMUM)
-        self.audio_processor = AutoProcessor.from_pretrained(
-            self.model, trust_remote_code=True
-        )
-        self.audio_model = Qwen2AudioForConditionalGeneration.from_pretrained(
-            self.model, device_map="auto", dtype=torch.float16
-        ).eval()
 
-    def get_audio_embeddings(self, audio_features):
-        input_features, feature_attention_mask = (
-            audio_features.input_features,
-            audio_features.feature_attention_mask,
+        # Use vLLM's processor since transformers 4.x doesn't support qwen3_asr.
+        # Qwen3ASRProcessor requires a text argument; we pass a dummy placeholder.
+        self.audio_processor = Qwen3ASRProcessor.from_pretrained(self.model)
+        self._processor_dummy_text = "<|im_start|>"
+
+        # Load config and instantiate only the audio tower (encoder + projector).
+        # The LLM decoder runs on the downstream PD worker.
+        # vLLM's Qwen3OmniMoeAudioEncoder already includes proj1/proj2, so there is
+        # no separate multi_modal_projector to call.
+        hf_config = Qwen3ASRConfig.from_pretrained(self.model)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            hf_config.thinker_config.audio_config
         )
+        self._load_audio_tower_weights(self.model)
+        self.audio_tower = self.audio_tower.to(torch.float16).cuda().eval()
+
+    def _load_audio_tower_weights(self, model_id: str) -> None:
+        """Load audio_tower weights from the model's safetensors shards."""
+        model_dir = snapshot_download(model_id, ignore_patterns=["*.msgpack", "*.h5"])
+        index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+
+        # Collect shard files that contain audio_tower weights
+        audio_prefix = "thinker.audio_tower."
+        shard_files = {
+            shard
+            for key, shard in index["weight_map"].items()
+            if key.startswith(audio_prefix)
+        }
+
+        state_dict = {}
+        for shard_file in shard_files:
+            shard_path = os.path.join(model_dir, shard_file)
+            tensors = load_file(shard_path)
+            for key, tensor in tensors.items():
+                if key.startswith(audio_prefix):
+                    new_key = key[len(audio_prefix):]
+                    state_dict[new_key] = tensor
+
+        missing, unexpected = self.audio_tower.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"Missing keys in audio_tower: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected keys in audio_tower: {unexpected}")
+
+    def get_audio_embeddings(self, processed) -> torch.Tensor:
+        """
+        Extract encoder + projector output from Qwen3-ASR.
+
+        Uses vLLM's Qwen3OmniMoeAudioEncoder which includes the projector
+        (proj1 → proj2) internally.  The forward signature differs from Qwen2-Audio:
+          - input_features: (num_mel, seq_len) — batch dim is squeezed
+          - feature_lens:   non-padded frame counts, shape (batch,)
+          - aftercnn_lens:  post-CNN lengths, computed by _get_feat_extract_output_lengths
+
+        Returns embeddings tensor of shape (num_tokens, embed_dim).
+        """
+        # (1, num_mel, seq_len) → (num_mel, seq_len)
+        input_features = processed.input_features.squeeze(0).to(
+            self.audio_tower.dtype, device=self.audio_tower.device
+        )
+        feature_lens = processed.feature_attention_mask.sum(-1).to(
+            device=self.audio_tower.device
+        )
+        aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+
         with torch.no_grad():
-            (
-                audio_feat_lengths,
-                audio_output_lengths,
-            ) = self.audio_model.audio_tower._get_feat_extract_output_lengths(
-                feature_attention_mask.sum(-1)
+            # audio_tower returns a flat (total_tokens, embed_dim) tensor
+            audio_embeddings = self.audio_tower(
+                input_features,
+                feature_lens=feature_lens,
+                aftercnn_lens=aftercnn_lens,
             )
-            batch_size, _, max_mel_seq_len = input_features.shape
-            max_seq_len = (max_mel_seq_len - 2) // 2 + 1
-            # Create a sequence tensor of shape (batch_size, max_seq_len)
-            seq_range = (
-                torch.arange(
-                    0,
-                    max_seq_len,
-                    dtype=audio_feat_lengths.dtype,
-                    device=audio_feat_lengths.device,
-                )
-                .unsqueeze(0)
-                .expand(batch_size, max_seq_len)
-            )
-            lengths_expand = audio_feat_lengths.unsqueeze(1).expand(
-                batch_size, max_seq_len
-            )
-            # Create mask
-            padding_mask = seq_range >= lengths_expand
-
-            audio_attention_mask_ = padding_mask.view(
-                batch_size, 1, 1, max_seq_len
-            ).expand(batch_size, 1, max_seq_len, max_seq_len)
-            audio_attention_mask = audio_attention_mask_.to(
-                dtype=self.audio_model.audio_tower.conv1.weight.dtype,
-                device=self.audio_model.audio_tower.conv1.weight.device,
-            )
-            audio_attention_mask[audio_attention_mask_] = float("-inf")
-
-            audio_outputs = self.audio_model.audio_tower(
-                input_features, attention_mask=audio_attention_mask
-            )
-            selected_audio_feature = audio_outputs.last_hidden_state
-            audio_features = self.audio_model.multi_modal_projector(
-                selected_audio_feature
-            )
-
-            num_audios, max_audio_tokens, embed_dim = audio_features.shape
-            audio_features_mask = torch.arange(
-                max_audio_tokens, device=audio_output_lengths.device
-            )[None, :]
-            audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
-            audio_features = audio_features[audio_features_mask]
-
-            return audio_features
+        return audio_embeddings
 
     def cleanup(self):
         pass
@@ -147,26 +176,27 @@ class VllmEncodeWorker:
 
         request_id = request.request_id
 
-        # The following steps encode the requested audio and provided useful embeddings.
-        # 1. Open the audio from the provided URL.
-        # 2. Process the audio using the audio processor.
-        # 3. Run the audio through the audio model's audio tower.
-        # 4. Run the results of the audio tower through the multi-modal projector.
-        # 5. Create a descriptor for the embeddings.
-        # 6. Create a write operation using the serialized request and the descriptor.
-        # 7. Await for the write operation to complete.
-        # 8. Yield the encode response.
+        # The following steps encode the requested audio and produce embeddings:
+        # 1. Load the audio from the provided URL.
+        # 2. Process the audio using the Qwen3-ASR processor.
+        # 3. Run the audio through the ASR model's audio encoder.
+        # 4. Run the encoder output through the projector.
+        # 5. Create a NIXL descriptor for the embeddings.
+        # 6. Transfer embeddings to the downstream PD worker via RDMA.
+        # 7. Stream the decode response back.
 
         try:
             audio, sr = await self.audio_loader.load_audio(
                 request.multimodal_input.audio_url
             )
 
-            audio_features = self.audio_processor(
-                text="test<|AUDIO|>", audio=audio, return_tensors="pt", padding=False
+            processed = self.audio_processor(
+                audio=audio,
+                text=self._processor_dummy_text,
+                return_tensors="pt",
+                sampling_rate=sr,
             )
-            with torch.no_grad():
-                audio_embeddings = self.get_audio_embeddings(audio_features)
+            audio_embeddings = self.get_audio_embeddings(processed)
             descriptor = connect.Descriptor(audio_embeddings)
             with await self._connector.create_readable(descriptor) as readable:
                 request.serialized_request = readable.metadata()
@@ -199,7 +229,7 @@ class VllmEncodeWorker:
     async def async_init(self, runtime: DistributedRuntime):
         logger.info("Startup started.")
         # Create and initialize a dynamo connector for this worker.
-        # We'll needs this to move data between this worker and remote workers efficiently.
+        # We'll need this to move data between this worker and remote workers efficiently.
         self._connector = connect.Connector()
 
         logger.info("Startup completed.")
@@ -211,7 +241,7 @@ class VllmEncodeWorker:
         DEFAULT_DOWNSTREAM_ENDPOINT = f"dyn://{DYN_NAMESPACE}.llm.generate"
 
         parser = FlexibleArgumentParser(
-            description="vLLM based encoder for Dynamo LLM."
+            description="Qwen3-ASR based encoder for Dynamo LLM."
         )
         parser.add_argument(
             "--endpoint",
@@ -258,7 +288,7 @@ async def worker(runtime: DistributedRuntime):
     logging.info("Signal handlers set up for graceful shutdown")
 
     # worker setup
-    args, config = VllmEncodeWorker.parse_args()
+    args, config = AsrEncodeWorker.parse_args()
     await init(runtime, args, config)
 
 
@@ -274,7 +304,7 @@ async def init(runtime: DistributedRuntime, args: argparse.Namespace, config: Co
     )
     pd_worker_client = await runtime.namespace(parsed_namespace).component(parsed_component_name).endpoint(parsed_endpoint_name).client()
 
-    handler = VllmEncodeWorker(args, config.engine_args, pd_worker_client)
+    handler = AsrEncodeWorker(args, config.engine_args, pd_worker_client)
     await handler.async_init(runtime)
 
     logger.info("Waiting for PD Worker Instances ...")

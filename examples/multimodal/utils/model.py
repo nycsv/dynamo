@@ -29,6 +29,8 @@ class SupportedModels:
     QWEN_2_5_VL_7B = "Qwen/Qwen2.5-VL-7B-Instruct"
     LLAVA_NEXT_VIDEO_7B = "llava-hf/LLaVA-NeXT-Video-7B-hf"
     QWEN_2_AUDIO_7B = "Qwen/Qwen2-Audio-7B-Instruct"
+    QWEN3_ASR_0_6B = "Qwen/Qwen3-ASR-0.6B"
+    QWEN3_ASR_1_7B = "Qwen/Qwen3-ASR-1.7B"
 
 
 def load_vision_model(model_id: str) -> torch.nn.Module:
@@ -51,6 +53,11 @@ def construct_mm_data(
 ) -> Dict[str, torch.Tensor | Dict[str, Any]]:
     """Construct multimodal data for a vLLM request for models that require additional parameters alongside the embeddings"""
     if model == SupportedModels.QWEN_2_AUDIO_7B:
+        audio_embeds = audio_embeds.to(torch.bfloat16)
+        assert audio_embeds.ndim == 2, "Audio embeddings must be 2D"
+        return {"audio": [audio_embeds]}
+    # Handle Qwen3-ASR models
+    if model in (SupportedModels.QWEN3_ASR_0_6B, SupportedModels.QWEN3_ASR_1_7B):
         audio_embeds = audio_embeds.to(torch.bfloat16)
         assert audio_embeds.ndim == 2, "Audio embeddings must be 2D"
         return {"audio": [audio_embeds]}
