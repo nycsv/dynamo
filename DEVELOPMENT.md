@@ -33,34 +33,58 @@ uv --version
 
 ## Development Workflow
 
-### 1. Clone Repository
+### Quick Start (Recommended)
+
+```bash
+# Install uv (recommended Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment
+uv venv venv
+source venv/bin/activate
+
+# Clone repository and install Dynamo in development mode
+git clone https://github.com/ai-dynamo/dynamo.git
+cd dynamo
+
+uv pip install -e ".[vllm]"  # Install with vLLM backend
+```
+
+### Step-by-Step Setup
+
+#### 1. Install `uv` (recommended)
+
+```bash
+# Install uv (10-100× faster than pip, reliable editable installs)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Verify
+uv --version
+```
+
+#### 2. Clone Repository
 
 ```bash
 git clone https://github.com/ai-dynamo/dynamo.git
 cd dynamo
 ```
 
-### 2. Create Virtual Environment
+#### 3. Create Virtual Environment
 
 ```bash
 # Using uv (preferred — faster, cleaner)
-uv venv
-
-# Or using Python's built-in venv
-python3 -m venv venv
-
-# Activate
-source venv/bin/activate   # Linux / macOS
+uv venv venv
+source venv/bin/activate    # Linux / macOS
 # or
-venv\Scripts\activate      # Windows
+venv\Scripts\activate       # Windows (PowerShell)
 ```
 
-### 3. Install Dynamo in Development Mode
+#### 4. Install Dynamo in Development Mode
 
 For **base framework**:
 
 ```bash
-# Install with vLLM backend
+# Install with vLLM backend (default)
 uv pip install -e ".[vllm]"
 
 # Or install with TRT-LLM backend
@@ -70,7 +94,7 @@ uv pip install -e ".[trtllm]"
 uv pip install -e ".[sglang]"
 ```
 
-For **multimodal ASR examples**:
+For **multimodal ASR examples** (after base installation):
 
 ```bash
 cd examples/multimodal
@@ -79,11 +103,10 @@ cd examples/multimodal
 bash launch/install.sh
 
 # Or manual with uv:
-uv pip install -e "../../[vllm]"
 uv pip install vllm-omni==0.16.0rc1 'vllm[audio]' accelerate cupy-cuda12x
 ```
 
-### 4. Verify Installation
+#### 5. Verify Installation
 
 ```bash
 python -c "import dynamo; print('✓ Dynamo installed')"

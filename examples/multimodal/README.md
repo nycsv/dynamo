@@ -91,44 +91,56 @@ HTTP Response (JSON / SSE)
 | RAM | 32 GB system memory |
 | Disk | 20 GB free (model + packages) |
 
-### Quick setup (no Docker, no sudo)
+### Quick setup (Recommended with `uv`)
 
-`install.sh` creates a local venv, downloads etcd and nats-server binaries, installs all Python packages, and pre-downloads the model:
+`uv` is 10-100× faster than pip with reliable editable installs. Install it first, then run setup:
+
+```bash
+# Install uv (recommended Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate virtual environment
+uv venv venv
+source venv/bin/activate
+
+# Run one-time setup (handles etcd, NATS, model download)
+cd examples/multimodal
+bash launch/install.sh
+```
+
+Or use the bundled `install.sh` script (which handles venv creation automatically):
 
 ```bash
 cd examples/multimodal
 bash launch/install.sh
-# Optional flags:
-#   --venv /custom/venv/path
-#   --model Qwen/Qwen3-ASR-0.6B
-```
-
-After it finishes, activate the venv for all subsequent commands:
-
-```bash
 source ./venv/bin/activate
 ```
 
-### Manual installation
+### Manual installation with `uv` (recommended)
 
-If you prefer to manage your own environment:
+For faster, more reliable installation with editable packages:
 
 ```bash
-# 1. Python packages
-pip install uv
-pip install ai-dynamo 'vllm[audio]' accelerate cupy-cuda12x uvloop safetensors huggingface_hub
+# 1. Install uv (recommended Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. vllm-omni — REQUIRED for Qwen3-ASR
+# 2. Create virtual environment
+uv venv venv
+source venv/bin/activate
+
+# 3. Install Dynamo with vLLM
+uv pip install ai-dynamo 'vllm[audio]' accelerate cupy-cuda12x uvloop safetensors huggingface_hub
+
+# 4. Install vllm-omni — REQUIRED for Qwen3-ASR
 #    Provides: vllm.transformers_utils.configs.qwen3_asr
 #              vllm.model_executor.models.qwen3_omni_moe_thinker
-pip install vllm-omni==0.16.0rc1 || {
-    # Fall back to building from source if not on PyPI
+uv pip install vllm-omni==0.16.0rc1 || {
     git clone --depth 1 --branch v0.16.0rc1 https://github.com/vllm-project/vllm-omni.git /tmp/vllm-omni
-    pip install /tmp/vllm-omni
+    uv pip install /tmp/vllm-omni
 }
-python -c "from vllm.transformers_utils.configs.qwen3_asr import Qwen3ASRConfig; print('vllm-omni OK')"
+python -c "from vllm.transformers_utils.configs.qwen3_asr import Qwen3ASRConfig; print('✓ vllm-omni OK')"
 
-# 3. Infrastructure (etcd + NATS)
+# 5. Start infrastructure (etcd + NATS)
 #    Via Docker:
 docker run -d --name etcd --restart unless-stopped -p 2379:2379 \
     quay.io/coreos/etcd:v3.5.0 etcd \
@@ -136,16 +148,23 @@ docker run -d --name etcd --restart unless-stopped -p 2379:2379 \
     --advertise-client-urls http://localhost:2379
 docker run -d --name nats --restart unless-stopped -p 4222:4222 nats:latest
 
-#    Or bare-metal (same binaries install.sh downloads):
-#    etcd v3.5.21 from github.com/etcd-io/etcd/releases
-#    nats-server v2.12.4 from github.com/nats-io/nats-server/releases
-
-# 4. Pre-download model (optional but recommended — avoids startup timeout)
-python -c "
+# 6. Pre-download model (optional but recommended — avoids startup timeout)
+python << 'EOF'
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3-ASR-1.7B', ignore_patterns=['*.msgpack','*.h5'])
-"
+path = snapshot_download('Qwen/Qwen3-ASR-1.7B', ignore_patterns=['*.msgpack','*.h5'])
+print(f'✓ Model cached at: {path}')
+EOF
 ```
+
+**Or if you prefer traditional `pip`:**
+
+```bash
+pip install pip  # upgrade pip first
+pip install ai-dynamo 'vllm[audio]' accelerate cupy-cuda12x uvloop safetensors huggingface_hub
+pip install vllm-omni==0.16.0rc1
+```
+
+See [DEVELOPMENT.md](../../DEVELOPMENT.md) for more package manager details.
 
 ---
 
