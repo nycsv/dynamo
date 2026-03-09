@@ -4,6 +4,10 @@
 title: Prometheus
 ---
 
+For general TensorRT-LLM features and configuration, see the [Reference Guide](trtllm-reference-guide.md).
+
+---
+
 ## Overview
 
 When running TensorRT-LLM through Dynamo, TensorRT-LLM's Prometheus metrics are automatically passed through and exposed on Dynamo's `/metrics` endpoint (default port 8081). This allows you to access both TensorRT-LLM engine metrics (prefixed with `trtllm_`) and Dynamo runtime metrics (prefixed with `dynamo_*`) from a single worker backend endpoint.
@@ -52,7 +56,7 @@ curl -H 'Content-Type: application/json' \
 -d '{
   "model": "<model_name>",
   "max_completion_tokens": 100,
-  "messages": [{"role": "user", "content": "Hello"}]
+  "messages": [{"role": "user", "content": "Explain why Roger Federer is considered one of the greatest tennis players of all time"}]
 }' \
 http://localhost:8000/v1/chat/completions
 
@@ -129,6 +133,38 @@ The following metrics are exposed via Dynamo's `/metrics` endpoint (with the `tr
 These metric names and availability are subject to change with TensorRT-LLM version updates.
 
 TensorRT-LLM provides Prometheus metrics through the `MetricsCollector` class (see [tensorrt_llm/metrics/collector.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/metrics/collector.py)).
+
+### Additional Operational Metrics
+
+Dynamo adds the following operational metrics for TensorRT-LLM workers. These complement the engine's native metrics above with request-level observability that the engine does not provide. All metrics use the `trtllm_` prefix and are automatically enabled when `--publish-events-and-metrics` is set.
+
+Metric name constants are defined in `lib/runtime/src/metrics/prometheus_names.rs` (`trtllm_additional` module).
+
+#### Request Type Tracking
+
+- `trtllm_request_type_image_total` (Counter) — Total number of requests containing image/multimodal content
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+- `trtllm_request_type_structured_output_total` (Counter) — Total number of requests using guided/structured decoding (JSON, regex, grammar, etc.)
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+
+#### Abort Tracking
+
+- `trtllm_num_aborted_requests_total` (Counter) — Total number of aborted/cancelled requests
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+
+#### KV Cache Transfer Metrics (Disaggregated Deployments)
+
+These metrics are only recorded in disaggregated (prefill + decode) deployments when a KV cache transfer actually occurs. They are sourced from TensorRT-LLM's `RequestPerfMetrics.timing_metrics`.
+
+- `trtllm_kv_transfer_success_total` (Counter) — Total number of successful KV cache transfers (recorded on prefill side)
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+- `trtllm_kv_transfer_latency_seconds` (Histogram) — KV cache transfer latency per request in seconds
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+- `trtllm_kv_transfer_bytes` (Histogram) — KV cache transfer size per request in bytes
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
+  - Buckets: 100KB, 500KB, 1MB, 5MB, 10MB, 50MB, 100MB, 500MB, 1GB, 5GB
+- `trtllm_kv_transfer_speed_gb_s` (Histogram) — KV cache transfer speed per request in GB/s
+  - Labels: `model_name`, `disaggregation_mode`, `engine_type`
 
 ## Non-Prometheus Performance Metrics
 
